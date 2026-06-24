@@ -36,19 +36,34 @@ def tg(method, **params):
         return json.load(r)
 
 
+def _money(v):
+    if v >= 1e6:
+        return "${:.2f}M".format(v / 1e6)
+    if v >= 1e3:
+        return "${:,.0f}".format(v)
+    return "${:.2f}".format(v)
+
+
 def price_text():
     try:
         with urllib.request.urlopen(PRICE_URL, timeout=10) as r:
             d = json.load(r)
         usd = float(d["usd"])
+        chg = d.get("change_24h_pct")
+        vol = d.get("vol_24h_usd")
+        mcap = d.get("mcap_usd")
         now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-        return (
-            "\U0001F4B2 GenesisL1 (L1)\n\n"
-            "Price: ${:.6f}\n"
-            "Source: Osmosis router (USDC)\n"
-            "Updated: {}\n\n"
-            "via github.com/VanPez/l1price"
-        ).format(usd, now)
+        price_line = "Price: ${:.6f}".format(usd)
+        if chg is not None:
+            price_line += "  (24h {:+.1f}%)".format(chg)
+        lines = ["\U0001F4B2 GenesisL1 (L1)", "", price_line]
+        if vol is not None:
+            lines.append("24h Volume: " + _money(vol))
+        if mcap is not None:
+            lines.append("Market Cap: " + _money(mcap))
+        lines += ["Source: Osmosis (USDC)", "Updated: " + now, "",
+                  "via github.com/VanPez/l1price"]
+        return "\n".join(lines)
     except Exception:
         now = datetime.now(timezone.utc).strftime("%H:%M UTC")
         return "⚠️ L1 price temporarily unavailable ({})".format(now)

@@ -1,26 +1,30 @@
 # l1price — a public price API for GenesisL1 (L1)
 
-A tiny, zero-dependency HTTP service that serves the live **L1/USD** price, so the
-GenesisL1 community can stop reinventing price-fetching: point any bot, dashboard,
-or widget at one URL.
+A tiny, zero-dependency HTTP service that serves the live **L1/USD price, 24h
+volume, 24h change, and market cap**, so the GenesisL1 community can stop
+reinventing price-fetching: point any bot, dashboard, or widget at one URL.
 
 **Live instance:** `http://46.224.42.12:8585/price` · `http://46.224.42.12:8585/price.txt`
 
-## Where the price comes from
+## Where the data comes from
 
 L1 trades on **Osmosis** (IBC denom
 `ibc/F16FDC11A7662B86BC0B9CE61871CBACF7C20606F95E86260FD38915184B75B4`, channel-253).
-Instead of manually weighting pools and pulling CoinGecko quotes, this uses
-**Osmosis's own SQS router** (`sqs.osmosis.zone/tokens/prices`), which already routes
-across L1's liquidity and returns a **USDC-denominated** price in one call. That value
-is effectively L1/USD, and it tracks LiveCoinWatch's L1 page within ~0.5%.
+All sources are public and need no API key:
+
+- **Price + 24h volume + 24h change** — the Osmosis indexer (**Numia** public API,
+  `public-osmosis-api.numia.xyz`), which powers app.osmosis.zone. Falls back to the
+  Osmosis **SQS router** (`sqs.osmosis.zone`) for price if Numia is unreachable.
+- **Market cap** — total L1 supply from the GenesisL1 chain REST
+  (`api.genesisl1.org`) × price. Since L1 is fully circulating (nothing held back),
+  total supply is effectively the circulating supply, so the mcap is honest.
 
 ## Endpoints
 
 | Route        | Returns |
 |--------------|---------|
 | `GET /price`     | full JSON (below) |
-| `GET /price.txt` | one-line ticker, e.g. `L1 $0.040113` |
+| `GET /price.txt` | one-line ticker, e.g. `L1 $0.039602  24h +0.1%  vol $5,004  mcap $1.83M` |
 | `GET /health`    | `ok` |
 | `GET /`          | short help |
 
@@ -28,12 +32,15 @@ is effectively L1/USD, and it tracks LiveCoinWatch's L1 page within ~0.5%.
 {
   "symbol": "L1",
   "name": "GenesisL1",
-  "usd": 0.04011304,
-  "source": "osmosis-sqs",
-  "quote": "USDC",
-  "base_denom": "ibc/F16FDC11A7662B86BC0B9CE61871CBACF7C20606F95E86260FD38915184B75B4",
-  "updated": "2026-06-24T08:43:39Z",
-  "age_seconds": 4.2,
+  "usd": 0.03960195,
+  "change_24h_pct": 0.14,
+  "vol_24h_usd": 5004.26,
+  "mcap_usd": 1827928.07,
+  "supply": 46157530.13,
+  "liquidity_usd": 7128.36,
+  "source": "osmosis-numia",
+  "updated": "2026-06-24T13:04:21Z",
+  "age_seconds": 4.0,
   "stale": false
 }
 ```
@@ -74,8 +81,8 @@ docker run -d --name l1price --restart unless-stopped \
 ## Consume it
 
 ```bash
-curl -s http://YOUR-HOST:8585/price | jq .usd     # shell / bots
-curl -s http://YOUR-HOST:8585/price.txt           # -> "L1 $0.040113"
+curl -s http://YOUR-HOST:8585/price | jq '.usd, .vol_24h_usd, .mcap_usd'   # shell / bots
+curl -s http://YOUR-HOST:8585/price.txt   # -> "L1 $0.039602  24h +0.1%  vol $5,004  mcap $1.83M"
 ```
 
 ```js
