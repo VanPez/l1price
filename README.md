@@ -83,6 +83,23 @@ curl -s http://YOUR-HOST:8585/price.txt           # -> "L1 $0.040113"
 const { usd } = await (await fetch("http://YOUR-HOST:8585/price")).json();
 ```
 
+## Telegram bot (`l1bot.py`)
+
+A companion bot that posts the live price into a Telegram group, keeps it
+**pinned and auto-updating every minute** (edits one message, no spam), and
+answers **/price**. Zero dependencies, outbound-only (no inbound ports).
+
+```bash
+TG_BOT_TOKEN=<token from @BotFather> \
+TG_CHAT=@your_group \
+PRICE_URL=http://YOUR-HOST:8585/price \
+python3 l1bot.py
+```
+
+Add the bot to the group as an admin with **"Pin messages"**. It self-heals —
+it retries until it's added, so start order doesn't matter. Live instance runs
+in the `@genesisL1price` group.
+
 ## Roadmap
 
 Same pattern, more endpoints off a full node: `/supply`, `/validators`,
