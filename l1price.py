@@ -294,7 +294,7 @@ def _fetch_cumulative_vols():
             r = _get(LCD_VOL_URL.format(pid))
             amt = sum(int(v.get("amount", 0)) for v in (r.get("volume") or [])
                       if v.get("denom") == OSMO_DENOM)
-            out[pid] = amt
+            out[str(pid)] = amt   # str keys: survive the JSON persist round-trip (JSON keys are strings)
         except Exception:
             continue
     return out
@@ -367,8 +367,8 @@ def _vol_24h_osmo(pid):
             if e["ts"] <= target + SNAPSHOT_INTERVAL:
                 baseline = e
         age = latest["ts"] - baseline["ts"]
-        cur = latest["vols"].get(pid)
-        old = baseline["vols"].get(pid)
+        cur = latest["vols"].get(str(pid))   # str key — consistent in-memory and after JSON reload
+        old = baseline["vols"].get(str(pid))
         warming = age < 23 * 3600
         if warming or cur is None or old is None:
             return None, warming
