@@ -44,6 +44,17 @@ def _money(v):
     return "${:.2f}".format(v)
 
 
+def _source_label(src):
+    """Friendly label for the l1price `source` field. Auto-adapts: normally the
+    cross-venue blend; degrades to a single venue if the other is unreachable."""
+    return {
+        "blended:osmosis+base": "Osmosis + Base (liquidity-weighted)",
+        "osmosis-numia": "Osmosis (USDC)",
+        "osmosis-sqs": "Osmosis (USDC)",
+        "base-dexscreener": "Base (USDC)",
+    }.get(src, src or "—")
+
+
 def price_text():
     try:
         with urllib.request.urlopen(PRICE_URL, timeout=10) as r:
@@ -61,7 +72,7 @@ def price_text():
             lines.append("24h Volume: " + _money(vol))
         if mcap is not None:
             lines.append("Market Cap: " + _money(mcap))
-        lines += ["Source: Osmosis (USDC)", "Updated: " + now, "",
+        lines += ["Source: " + _source_label(d.get("source")), "Updated: " + now, "",
                   "via github.com/VanPez/l1price"]
         return "\n".join(lines)
     except Exception:
