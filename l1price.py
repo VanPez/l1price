@@ -6,15 +6,22 @@ Serves the live L1/USD price, 24h volume, and 24h change, PLUS a keyless
 per-pool liquidity map (/pools) for every L1 Osmosis pool. Zero dependencies -
 Python 3 standard library only.
 
+As of v4.0 the headline price is CROSS-VENUE: the L1/USD price is a
+liquidity-weighted blend of Osmosis (Numia/SQS) and Base (Uniswap wL1/USDC via
+DexScreener), so the deepest market dominates. A 2M-L1 Base pool therefore
+outweighs the thin Osmosis pools, matching the L1 Liquidity Map dApp.
+
 Endpoints:
-  GET /price       -> JSON {symbol,name,usd,change_24h_pct,vol_24h_usd,liquidity_usd,...}
+  GET /price       -> JSON {symbol,name,usd,change_24h_pct,vol_24h_usd,liquidity_usd,venues,...}
   GET /price.txt   -> "L1 $0.039672  24h +8.0%  vol $6,109"
   GET /pools       -> JSON {pools:[{id,pair,fee_pct,liquidity_usd,vol_24h_usd,apr_pct,warming_up}],...}
   GET /health      -> "ok"
   GET /            -> short help
 
 Data sources (all public, no API key):
-  - price/volume : Osmosis indexer (Numia public) + SQS fallback
+  - Osmosis price/volume : Osmosis indexer (Numia public) + SQS fallback
+  - Base price/volume/liq : DexScreener (wL1 token, every Base DEX), CORS-open
+  - headline usd : liquidity-weighted blend of the venues above
   - pool liquidity/fee/pair : Osmosis SQS  (liquidity_cap matches app.osmosis.zone)
   - pool 24h volume : the chain's per-pool CUMULATIVE volume (poolmanager
     total_volume, normalized in uosmo by Osmosis), snapshotted on a background
@@ -42,6 +49,12 @@ USDC_DENOM = "ibc/498A0751C798A0D9A389AA3691123DADA57DAA4FE165D5C75894505B876BA6
 NUMIA_URL  = "https://public-osmosis-api.numia.xyz/tokens/v2/L1"   # price + volume + change
 SQS_URL    = "https://sqs.osmosis.zone/tokens/prices?base=" + L1_DENOM  # price-only fallback
 SUPPLY_URL = "https://api.genesisl1.org/cosmos/bank/v1beta1/supply/by_denom?denom=el1"  # total supply (for mcap)
+
+# --- GenesisL1 (L1) on Base ---------------------------------------------------
+# Wrapped L1 on Base (address from M's explorer sidebar -> basescan). DexScreener
+# indexes every Base DEX, keyless + CORS-open; returns {"pairs":null} if no pool.
+WL1_BASE       = "0xe6522a891702cd2e8cc2a5182638c9da1dd44b22"
+DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/" + WL1_BASE
 
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "30"))
 PORT      = int(os.environ.get("PORT", "8585"))
@@ -78,7 +91,7 @@ _pools_cache = {"data": None, "ts": 0.0, "ok": False}
 
 
 def _get(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "l1price/3.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "l1price/4.0"})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         return json.load(r)
 
@@ -100,8 +113,8 @@ def _supply_mcap(usd):
         return None, None
 
 
-def _fetch():
-    """Primary: Numia (price + volume + 24h change). Fallback: SQS (price only)."""
+def _fetch_osmosis():
+    """Osmosis venue. Primary: Numia (price + volume + 24h change). Fallback: SQS (price only)."""
     try:
         arr = _get(NUMIA_URL)
         t = arr[0] if isinstance(arr, list) else arr
@@ -111,7 +124,7 @@ def _fetch():
         chg = _num(t.get("price_24h_change"))
         vol = _num(t.get("volume_24h"))
         liq = _num(t.get("liquidity"))
-        result = {
+        return {
             "usd": usd,
             "change_24h_pct": round(chg, 2) if chg is not None else None,
             "vol_24h_usd": round(vol, 2) if vol is not None else None,
@@ -124,9 +137,97 @@ def _fetch():
         raw = quotes.get(USDC_DENOM) or (next(iter(quotes.values())) if quotes else None)
         if raw is None:
             raise ValueError("no price from Numia or SQS")
-        result = {"usd": float(raw), "change_24h_pct": None, "vol_24h_usd": None,
-                  "liquidity_usd": None, "source": "osmosis-sqs"}
-    result["supply"], result["mcap_usd"] = _supply_mcap(result["usd"])
+        return {"usd": float(raw), "change_24h_pct": None, "vol_24h_usd": None,
+                "liquidity_usd": None, "source": "osmosis-sqs"}
+
+
+def _fetch_base():
+    """Base (wL1) venue from DexScreener: liquidity-weighted price + total liq + 24h vol.
+    Returns {"usd","liquidity_usd","vol_24h_usd","source"} or None if no Base pool / unreachable."""
+    try:
+        d = _get(DEXSCREENER_URL)
+    except Exception:
+        return None
+    pairs = [p for p in (d.get("pairs") or []) if p.get("chainId") == "base"]
+    if not pairs:
+        return None
+    liq_sum = vol_sum = 0.0
+    pw_sum = pl_sum = 0.0   # price*liq accumulator, and liq of priced pools
+    for p in pairs:
+        liq = _num((p.get("liquidity") or {}).get("usd")) or 0.0
+        vol = _num((p.get("volume") or {}).get("h24")) or 0.0
+        # DexScreener priceUsd is the price of the pair's BASE token; only trust it
+        # for wL1's price when wL1 IS the base token (else it's the other asset's price).
+        wl1_is_base = ((p.get("baseToken") or {}).get("address") or "").lower() == WL1_BASE
+        price = _num(p.get("priceUsd")) if wl1_is_base else None
+        liq_sum += liq
+        vol_sum += vol
+        if price is not None and liq > 0:
+            pw_sum += price * liq
+            pl_sum += liq
+    return {
+        "usd": (pw_sum / pl_sum) if pl_sum > 0 else None,
+        "liquidity_usd": round(liq_sum, 2),
+        "vol_24h_usd": round(vol_sum, 2),
+        "source": "base-dexscreener",
+    }
+
+
+def _blend(osmo, base):
+    """Liquidity-weight each venue's own USD price by that venue's liquidity."""
+    parts = []
+    if osmo.get("usd") is not None and (osmo.get("liquidity_usd") or 0) > 0:
+        parts.append((osmo["usd"], osmo["liquidity_usd"]))
+    if base and base.get("usd") is not None and (base.get("liquidity_usd") or 0) > 0:
+        parts.append((base["usd"], base["liquidity_usd"]))
+    if parts:
+        lsum = sum(l for _, l in parts)
+        return sum(p * l for p, l in parts) / lsum if lsum > 0 else osmo.get("usd")
+    # No liquidity figures on EITHER venue to weight by (rare: Osmosis on SQS-fallback
+    # AND Base reporting no liquidity) -> prefer the historically-trusted Osmosis price.
+    if osmo.get("usd") is not None:
+        return osmo["usd"]
+    return base.get("usd") if base else None
+
+
+def _fetch():
+    """Cross-venue: blend Osmosis + Base into one liquidity-weighted L1/USD price."""
+    osmo = _fetch_osmosis()               # raises if even Osmosis is unreachable
+    base = _fetch_base()                  # None if no Base pool / DexScreener down
+
+    usd = _blend(osmo, base)
+    if usd is None:
+        raise ValueError("no usable price from any venue")
+
+    def _sum(*xs):
+        vals = [x for x in xs if x is not None]
+        return round(sum(vals), 2) if vals else None
+
+    total_liq = _sum(osmo.get("liquidity_usd"), base.get("liquidity_usd") if base else None)
+    total_vol = _sum(osmo.get("vol_24h_usd"), base.get("vol_24h_usd") if base else None)
+
+    if base:
+        source = "blended:osmosis+base"
+    else:
+        source = osmo["source"]
+
+    result = {
+        "usd": usd,
+        # 24h change stays Osmosis-derived (Numia) — a true cross-venue change needs
+        # 24h-ago prices per venue, which neither source exposes. Flagged, not blended.
+        "change_24h_pct": osmo.get("change_24h_pct"),
+        "vol_24h_usd": total_vol,
+        "liquidity_usd": total_liq,
+        "source": source,
+        "venues": {
+            "osmosis": {"usd": osmo.get("usd"), "liquidity_usd": osmo.get("liquidity_usd"),
+                        "vol_24h_usd": osmo.get("vol_24h_usd"), "source": osmo.get("source")},
+            "base": ({"usd": base.get("usd"), "liquidity_usd": base.get("liquidity_usd"),
+                      "vol_24h_usd": base.get("vol_24h_usd"), "source": base.get("source")}
+                     if base else None),
+        },
+    }
+    result["supply"], result["mcap_usd"] = _supply_mcap(usd)
     return result
 
 
@@ -157,6 +258,7 @@ def _payload():
         "supply": d.get("supply"),
         "liquidity_usd": d["liquidity_usd"],
         "source": d["source"],
+        "venues": d.get("venues"),
         "updated": datetime.fromtimestamp(c["ts"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "age_seconds": age,
         "stale": age > CACHE_TTL,
@@ -337,7 +439,7 @@ def _ticker(p):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "l1price/3.0"
+    server_version = "l1price/4.0"
 
     def _send(self, code, body, ctype="application/json"):
         body = body.encode() if isinstance(body, str) else body
@@ -355,7 +457,7 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("", "/"):
                 self._send(200,
                     "l1price - GenesisL1 (L1) price + liquidity API\n"
-                    "  GET /price      JSON price + 24h volume + 24h change\n"
+                    "  GET /price      JSON price (cross-venue) + 24h volume + 24h change\n"
                     "  GET /price.txt  one-line ticker\n"
                     "  GET /pools      JSON per-pool liquidity + 24h volume + APR\n"
                     "  GET /health     ok\n",
