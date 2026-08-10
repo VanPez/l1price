@@ -8,16 +8,47 @@ reinventing price-fetching: point any bot, dashboard, or widget at one URL.
 
 ## Where the data comes from
 
-L1 trades on **Osmosis** (IBC denom
-`ibc/F16FDC11A7662B86BC0B9CE61871CBACF7C20606F95E86260FD38915184B75B4`, channel-253).
-All sources are public and need no API key:
+L1 trades on **two venues**, and the headline price is a **liquidity-weighted blend** of
+both, so the deeper market dominates. All sources are public and need no API key.
 
-- **Price + 24h volume + 24h change** — the Osmosis indexer (**Numia** public API,
-  `public-osmosis-api.numia.xyz`), which powers app.osmosis.zone. Falls back to the
-  Osmosis **SQS router** (`sqs.osmosis.zone`) for price if Numia is unreachable.
-- **Market cap** — total L1 supply from the GenesisL1 chain REST
-  (`api.genesisl1.org`) × price. Since L1 is fully circulating (nothing held back),
-  total supply is effectively the circulating supply, so the mcap is honest.
+**Osmosis** — IBC denom
+`ibc/F16FDC11A7662B86BC0B9CE61871CBACF7C20606F95E86260FD38915184B75B4`, channel-253.
+Price, 24h volume and 24h change come from the **Numia** public indexer
+(`public-osmosis-api.numia.xyz`), which powers app.osmosis.zone, falling back to the
+Osmosis **SQS router** (`sqs.osmosis.zone`) for price alone.
+
+**Base** — wrapped L1 (`wL1`, `0xE6522A891702Cd2E8CC2A5182638c9DA1DD44B22`) against USDC on
+Uniswap v3, read **directly from the pool contract** over a public Base RPC: `slot0()` for
+the spot price and `balanceOf()` on both sides for the depth. No indexer sits in the path.
+
+> **Why on-chain and not an indexer.** This originally used DexScreener, which stopped
+> returning anything for wL1 — the token simply is not in their index, though Dextools
+> carries it. The Base leg silently returned nothing, the blend collapsed to Osmosis alone,
+> and the published price tracked a venue holding ~5% of the liquidity for weeks before a
+> community member noticed the mismatch. Reading the pool cannot be de-listed or
+> rate-limited, and matches the GenesisL1 posture of not depending on third parties.
+>
+> Both are overridable without a redeploy: `WL1_POOL` and `BASE_RPCS`.
+
+**Market cap** — total L1 supply from the GenesisL1 chain REST (`api.genesisl1.org`) ×
+blended price. L1 is fully circulating, so total supply is the circulating supply and the
+mcap is honest.
+
+### Health fields, and why they exist
+
+The failure above was invisible because a missing venue looked identical to a working one.
+So the response says so outright:
+
+| field | meaning |
+|---|---|
+| `degraded` | `true` when a venue is unavailable and the headline rests on one market |
+| `note` | plain-English explanation when degraded |
+| `vol_24h_complete` | `false` when the volume total is not cross-venue |
+| `venues.*` | each venue's own price, depth and source — always inspect this before quoting a number |
+
+`vol_24h_complete` is normally **false**: the on-chain Base read gives price and depth but
+not 24h volume, which would need a log scan over ~43k blocks — out of scope for a 30-second
+endpoint. The total is Osmosis-only and says so rather than passing as cross-venue.
 
 ## Endpoints
 
@@ -32,22 +63,33 @@ All sources are public and need no API key:
 {
   "symbol": "L1",
   "name": "GenesisL1",
-  "usd": 0.03960195,
-  "change_24h_pct": 0.14,
-  "vol_24h_usd": 5004.26,
-  "mcap_usd": 1827928.07,
-  "supply": 46157530.13,
-  "liquidity_usd": 7128.36,
-  "source": "osmosis-numia",
-  "updated": "2026-06-24T13:04:21Z",
-  "age_seconds": 4.0,
+  "usd": 0.10992173,
+  "change_24h_pct": -5.85,
+  "vol_24h_usd": 1223.77,
+  "vol_24h_complete": false,
+  "mcap_usd": 5140451.81,
+  "supply": 46764657.1,
+  "liquidity_usd": 210211.0,
+  "source": "blended:osmosis+base",
+  "degraded": false,
+  "note": null,
+  "venues": {
+    "osmosis": { "usd": 0.10403084, "liquidity_usd": 11197.26,
+                 "vol_24h_usd": 1223.77, "source": "osmosis-numia" },
+    "base":    { "usd": 0.11025317, "liquidity_usd": 199013.74, "vol_24h_usd": null,
+                 "source": "base-uniswap-v3-onchain",
+                 "pool": "0xde9ba4084bf0733a9d69e42e71e5fd140179df71" }
+  },
+  "updated": "2026-08-10T14:27:26Z",
+  "age_seconds": 2.1,
   "stale": false
 }
 ```
 
 - Responses are cached ~30s (configurable) so you can hammer it safely.
 - `Access-Control-Allow-Origin: *` is set, so browser/JS/Streamlit apps can call it directly.
-- If Osmosis is briefly unreachable, it serves the last good price and never crashes.
+- If a venue is briefly unreachable it serves the last good price and never crashes —
+  but sets `degraded` so you can tell.
 
 ## Run it
 
@@ -82,7 +124,7 @@ docker run -d --name l1price --restart unless-stopped \
 
 ```bash
 curl -s http://YOUR-HOST:8585/price | jq '.usd, .vol_24h_usd, .mcap_usd'   # shell / bots
-curl -s http://YOUR-HOST:8585/price.txt   # -> "L1 $0.039602  24h +0.1%  vol $5,004  mcap $1.83M"
+curl -s http://YOUR-HOST:8585/price.txt   # -> "L1 $0.109922  24h -5.9%  vol $1,224  mcap $5.14M"
 ```
 
 ```js

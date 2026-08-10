@@ -56,6 +56,27 @@ SUPPLY_URL = "https://api.genesisl1.org/cosmos/bank/v1beta1/supply/by_denom?deno
 WL1_BASE       = "0xe6522a891702cd2e8cc2a5182638c9da1dd44b22"
 DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/" + WL1_BASE
 
+# ON-CHAIN Base read. Added 2026-08-10 after the community reported the published price
+# tracking Osmosis only.
+#
+# DexScreener indexes NOTHING for wL1 — verified on /latest/dex/tokens and /tokens/v1,
+# Base and Ethereum, all empty. The token address was never wrong; DexScreener simply does
+# not carry this token while Dextools does. So _fetch_base() returned None, `venues.base`
+# was null, and the liquidity-weighted blend collapsed to Osmosis alone. Osmosis held
+# ~$11k of liquidity against Base's ~$148k, so the headline was being set by the venue
+# with ~7% of the depth, and read ~6% low.
+#
+# Reading the pool contract removes the indexer from the loop. It cannot be de-listed,
+# rate-limited or silently changed, which is also the posture Mike wants for GenesisL1
+# infrastructure: "not rely on any 3rd party".
+WL1_POOL  = os.environ.get("WL1_POOL", "0xde9ba4084bf0733a9d69e42e71e5fd140179df71")
+BASE_RPCS = [u for u in os.environ.get(
+    "BASE_RPCS",
+    "https://mainnet.base.org,https://base-rpc.publicnode.com,"
+    "https://base.llamarpc.com,https://1rpc.io/base").split(",") if u.strip()]
+_SEL = {"slot0": "3850c7bd", "token0": "0dfe1681", "token1": "d21220a7",
+        "decimals": "313ce567", "balanceOf": "70a08231"}
+
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "30"))
 PORT      = int(os.environ.get("PORT", "8585"))
 TIMEOUT   = 12
@@ -141,9 +162,81 @@ def _fetch_osmosis():
                 "liquidity_usd": None, "source": "osmosis-sqs"}
 
 
-def _fetch_base():
-    """Base (wL1) venue from DexScreener: liquidity-weighted price + total liq + 24h vol.
-    Returns {"usd","liquidity_usd","vol_24h_usd","source"} or None if no Base pool / unreachable."""
+def _rpc(to, data):
+    """One eth_call, first RPC that answers. Returns hex result or None."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                       "params": [{"to": to, "data": data}, "latest"]}).encode()
+    for url in BASE_RPCS:
+        try:
+            req = urllib.request.Request(url, data=body, headers={
+                "Content-Type": "application/json", "User-Agent": "l1price/1.1"})
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                out = json.loads(r.read())
+            res = out.get("result")
+            if res and res != "0x":
+                return res
+        except Exception:
+            continue
+    return None
+
+
+def _hexint(h, start=0, width=64):
+    return int(h[2:][start:start + width], 16) if h and len(h[2:]) >= start + width else 0
+
+
+def _fetch_base_onchain():
+    """Base venue read straight from the Uniswap v3 pool. No indexer.
+
+    Returns {"usd","liquidity_usd","vol_24h_usd","source","pool"} or None.
+
+    vol_24h_usd is None BY DESIGN: 24h volume needs a log scan over ~43k blocks, which is
+    not a job for a 30-second price endpoint. Reported as None rather than 0 so it is
+    visibly absent instead of silently understating the cross-venue total.
+    """
+    t0 = _rpc(WL1_POOL, "0x" + _SEL["token0"])
+    t1 = _rpc(WL1_POOL, "0x" + _SEL["token1"])
+    if not t0 or not t1:
+        return None
+    a0, a1 = "0x" + t0[-40:], "0x" + t1[-40:]
+    # Do not assume the ordering — Uniswap sorts tokens by address, and a redeploy of
+    # either side would flip it. Getting this backwards inverts the price silently.
+    if a0.lower() == WL1_BASE:
+        wl1, quote, wl1_is_t0 = a0, a1, True
+    elif a1.lower() == WL1_BASE:
+        wl1, quote, wl1_is_t0 = a1, a0, False
+    else:
+        return None
+    d0 = _hexint(_rpc(a0, "0x" + _SEL["decimals"]) or "") or 18
+    d1 = _hexint(_rpc(a1, "0x" + _SEL["decimals"]) or "") or 18
+
+    s0 = _rpc(WL1_POOL, "0x" + _SEL["slot0"])
+    if not s0:
+        return None
+    sq = _hexint(s0, 0, 64)
+    if not sq:
+        return None
+    t1_per_t0 = (sq / 2 ** 96) ** 2 * (10 ** d0) / (10 ** d1)
+    if not t1_per_t0:
+        return None
+    usd = t1_per_t0 if wl1_is_t0 else 1.0 / t1_per_t0     # quote side is a USD stable
+
+    pad = WL1_POOL.lower().replace("0x", "").rjust(64, "0")
+    bal_wl1 = _hexint(_rpc(wl1, "0x" + _SEL["balanceOf"] + pad) or "")
+    bal_q = _hexint(_rpc(quote, "0x" + _SEL["balanceOf"] + pad) or "")
+    dq = d1 if wl1_is_t0 else d0
+    dw = d0 if wl1_is_t0 else d1
+    liq = (bal_wl1 / 10 ** dw) * usd + (bal_q / 10 ** dq)
+
+    return {"usd": usd, "liquidity_usd": round(liq, 2), "vol_24h_usd": None,
+            "source": "base-uniswap-v3-onchain", "pool": WL1_POOL}
+
+
+def _fetch_base_dexscreener():
+    """Legacy DexScreener path, kept as a fallback only.
+
+    It returned nothing for a month without anyone noticing, which is the real lesson
+    here: a venue that vanishes must be visible in the response, not merely absent.
+    """
     try:
         d = _get(DEXSCREENER_URL)
     except Exception:
@@ -171,6 +264,20 @@ def _fetch_base():
         "vol_24h_usd": round(vol_sum, 2),
         "source": "base-dexscreener",
     }
+
+
+def _fetch_base():
+    """On-chain first, DexScreener only as a fallback."""
+    try:
+        b = _fetch_base_onchain()
+    except Exception:
+        b = None
+    if b and b.get("usd"):
+        return b
+    try:
+        return _fetch_base_dexscreener()
+    except Exception:
+        return None
 
 
 def _blend(osmo, base):
@@ -204,12 +311,24 @@ def _fetch():
         return round(sum(vals), 2) if vals else None
 
     total_liq = _sum(osmo.get("liquidity_usd"), base.get("liquidity_usd") if base else None)
+    # NB when Base is read on-chain its 24h volume is None (a log scan is out of scope for
+    # a 30s endpoint), so this total is Osmosis-only. vol_24h_complete says so explicitly
+    # rather than letting a partial figure pass as a cross-venue total.
     total_vol = _sum(osmo.get("vol_24h_usd"), base.get("vol_24h_usd") if base else None)
+    vol_complete = bool(base) and base.get("vol_24h_usd") is not None
 
     if base:
         source = "blended:osmosis+base"
     else:
         source = osmo["source"]
+
+    # A MISSING VENUE MUST BE LOUD. The Base leg was returning None for weeks and the API
+    # kept serving a confident Osmosis-only number with no hint anything was wrong; it took
+    # a community member noticing a price mismatch. Absence of a field is not a signal
+    # anyone reads, so say it outright.
+    degraded = base is None
+    venue_note = None if base else ("Base venue unavailable - headline is Osmosis-only "
+                                    "and reflects the shallower market")
 
     result = {
         "usd": usd,
@@ -217,13 +336,17 @@ def _fetch():
         # 24h-ago prices per venue, which neither source exposes. Flagged, not blended.
         "change_24h_pct": osmo.get("change_24h_pct"),
         "vol_24h_usd": total_vol,
+        "vol_24h_complete": vol_complete,
         "liquidity_usd": total_liq,
         "source": source,
+        "degraded": degraded,
+        "note": venue_note,
         "venues": {
             "osmosis": {"usd": osmo.get("usd"), "liquidity_usd": osmo.get("liquidity_usd"),
                         "vol_24h_usd": osmo.get("vol_24h_usd"), "source": osmo.get("source")},
             "base": ({"usd": base.get("usd"), "liquidity_usd": base.get("liquidity_usd"),
-                      "vol_24h_usd": base.get("vol_24h_usd"), "source": base.get("source")}
+                      "vol_24h_usd": base.get("vol_24h_usd"), "source": base.get("source"),
+                      "pool": base.get("pool")}
                      if base else None),
         },
     }
@@ -254,10 +377,17 @@ def _payload():
         "usd": round(d["usd"], 8),
         "change_24h_pct": d["change_24h_pct"],
         "vol_24h_usd": d["vol_24h_usd"],
+        # _payload() WHITELISTS keys, so anything added to _fetch() must be added here too
+        # or it is silently dropped — which is exactly how these two got lost on the first
+        # pass. Health flags that never reach the response are worse than none, because
+        # they read as reassurance in the source.
+        "vol_24h_complete": d.get("vol_24h_complete"),
         "mcap_usd": d.get("mcap_usd"),
         "supply": d.get("supply"),
         "liquidity_usd": d["liquidity_usd"],
         "source": d["source"],
+        "degraded": d.get("degraded", False),
+        "note": d.get("note"),
         "venues": d.get("venues"),
         "updated": datetime.fromtimestamp(c["ts"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "age_seconds": age,

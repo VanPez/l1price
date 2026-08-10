@@ -51,7 +51,9 @@ def _source_label(src):
         "blended:osmosis+base": "Osmosis + Base (liquidity-weighted)",
         "osmosis-numia": "Osmosis (USDC)",
         "osmosis-sqs": "Osmosis (USDC)",
-        "base-dexscreener": "Base (USDC)",
+        "base-dexscreener": "Base (USDC)",          # legacy, DexScreener no longer
+                                                    # indexes wL1 — kept for old caches
+        "base-uniswap-v3-onchain": "Base (USDC, on-chain)",
     }.get(src, src or "—")
 
 
@@ -69,11 +71,21 @@ def price_text():
             price_line += "  (24h {:+.1f}%)".format(chg)
         lines = ["\U0001F4B2 GenesisL1 (L1)", "", price_line]
         if vol is not None:
-            lines.append("24h Volume: " + _money(vol))
+            # say so when the total is one venue only, rather than letting a partial
+            # figure read as cross-venue
+            lines.append("24h Volume: " + _money(vol)
+                         + ("" if d.get("vol_24h_complete") else "  (Osmosis only)"))
         if mcap is not None:
             lines.append("Market Cap: " + _money(mcap))
-        lines += ["Source: " + _source_label(d.get("source")), "Updated: " + now, "",
-                  "via github.com/VanPez/l1price"]
+        lines += ["Source: " + _source_label(d.get("source")), "Updated: " + now]
+        # SURFACE THE DEGRADED FLAG. The API has carried it since 2026-08-10, but the bot
+        # is what people actually read — and a health signal nobody sees is not a health
+        # signal. The original bug (Base venue silently absent for weeks, headline set by
+        # a venue holding ~5% of the depth) was invisible precisely here.
+        if d.get("degraded"):
+            note = d.get("note") or "one venue unavailable — price reflects a single market"
+            lines += ["", "\u26A0\uFE0F " + note]
+        lines += ["", "via github.com/VanPez/l1price"]
         return "\n".join(lines)
     except Exception:
         now = datetime.now(timezone.utc).strftime("%H:%M UTC")

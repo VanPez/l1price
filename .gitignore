@@ -1,0 +1,12 @@
+# runtime state — churns every minute, belongs on the server not in git
+pools_snapshots.json
+*.bak
+*.bak-*
+*.bak.*
+
+# secrets — the bot token lives in an env file on the host, never in the repo
+*.env
+l1bot.env
+
+__pycache__/
+*.pyc
