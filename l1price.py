@@ -20,7 +20,8 @@ Endpoints:
 
 Data sources (all public, no API key):
   - Osmosis price/volume : Osmosis indexer (Numia public) + SQS fallback
-  - Base price/volume/liq : DexScreener (wL1 token, every Base DEX), CORS-open
+  - Base price/liquidity  : the Uniswap v3 pool contract, read over a public Base RPC
+  - Base 24h volume       : Swap events scanned incrementally on the snapshot thread
   - headline usd : liquidity-weighted blend of the venues above
   - pool liquidity/fee/pair : Osmosis SQS  (liquidity_cap matches app.osmosis.zone)
   - pool 24h volume : the chain's per-pool CUMULATIVE volume (poolmanager
@@ -74,6 +75,30 @@ BASE_RPCS = [u for u in os.environ.get(
     "BASE_RPCS",
     "https://mainnet.base.org,https://base-rpc.publicnode.com,"
     "https://base.llamarpc.com,https://1rpc.io/base").split(",") if u.strip()]
+# BASE 24h VOLUME, by scanning Swap events.
+#
+# The first cut reported Base volume as None and labelled the total "Osmosis only". That
+# was needless: this service ALREADY banks periodic snapshots and diffs them over 24h for
+# the Osmosis pools (_ring / _snapshot_loop / _vol_24h_osmo). The same machinery works
+# here, so the honest answer to "can we do cross-venue volume" was yes.
+#
+# Method: on each snapshot tick, fetch Swap logs emitted since the last scan — ~900 Base
+# blocks at 30-minute intervals, small enough for any public RPC — and bank the USD amount
+# as one bucket. 24h volume is the sum of the buckets inside the window.
+#
+# Swap events give the EXACT traded amount, so this is not an estimate. The alternative,
+# diffing feeGrowthGlobal0X128, would have to back out volume through in-range liquidity
+# that moves during the window; it is an approximation where this is exact, and no cheaper.
+#
+# CONFIRMATION LAG: the scan stops short of the chain head. A reorg that reverts a swap we
+# had already banked would silently inflate volume forever, since buckets are never revised.
+BASE_SWAP_TOPIC   = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+BASE_VOL_CHUNK    = int(os.environ.get("BASE_VOL_CHUNK", "3000"))    # blocks per getLogs
+BASE_VOL_LAG      = int(os.environ.get("BASE_VOL_LAG", "12"))        # reorg safety margin
+BASE_VOL_BACKFILL = os.environ.get("BASE_VOL_BACKFILL", "1") != "0"
+_base_vol = {"buckets": [], "last_block": 0}   # [{"ts","from","to","usd"}]
+_base_vol_lock = threading.Lock()
+
 _SEL = {"slot0": "3850c7bd", "token0": "0dfe1681", "token1": "d21220a7",
         "decimals": "313ce567", "balanceOf": "70a08231"}
 
@@ -162,22 +187,29 @@ def _fetch_osmosis():
                 "liquidity_usd": None, "source": "osmosis-sqs"}
 
 
-def _rpc(to, data):
-    """One eth_call, first RPC that answers. Returns hex result or None."""
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
-                       "params": [{"to": to, "data": data}, "latest"]}).encode()
+def _rpc_raw(method, params, timeout=None):
+    """One JSON-RPC call against the first Base endpoint that answers."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1,
+                       "method": method, "params": params}).encode()
     for url in BASE_RPCS:
         try:
             req = urllib.request.Request(url, data=body, headers={
                 "Content-Type": "application/json", "User-Agent": "l1price/1.1"})
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            with urllib.request.urlopen(req, timeout=timeout or TIMEOUT) as r:
                 out = json.loads(r.read())
+            if "error" in out:
+                continue
             res = out.get("result")
-            if res and res != "0x":
+            if res is not None and res != "0x":
                 return res
         except Exception:
             continue
     return None
+
+
+def _rpc(to, data):
+    """One eth_call. Returns hex result or None."""
+    return _rpc_raw("eth_call", [{"to": to, "data": data}, "latest"])
 
 
 def _hexint(h, start=0, width=64):
@@ -189,9 +221,10 @@ def _fetch_base_onchain():
 
     Returns {"usd","liquidity_usd","vol_24h_usd","source","pool"} or None.
 
-    vol_24h_usd is None BY DESIGN: 24h volume needs a log scan over ~43k blocks, which is
-    not a job for a 30-second price endpoint. Reported as None rather than 0 so it is
-    visibly absent instead of silently understating the cross-venue total.
+    vol_24h_usd comes from the Swap-event ring banked by the snapshot thread, NOT from a
+    scan on the request path — a price endpoint must not depend on a log query. It is None
+    while the ring is still warming, so an incomplete window is visibly absent rather than
+    quietly understating the cross-venue total.
     """
     t0 = _rpc(WL1_POOL, "0x" + _SEL["token0"])
     t1 = _rpc(WL1_POOL, "0x" + _SEL["token1"])
@@ -227,8 +260,101 @@ def _fetch_base_onchain():
     dw = d0 if wl1_is_t0 else d1
     liq = (bal_wl1 / 10 ** dw) * usd + (bal_q / 10 ** dq)
 
-    return {"usd": usd, "liquidity_usd": round(liq, 2), "vol_24h_usd": None,
-            "source": "base-uniswap-v3-onchain", "pool": WL1_POOL}
+    vol, warming = _vol_24h_base()
+    return {"usd": usd, "liquidity_usd": round(liq, 2),
+            "vol_24h_usd": None if warming else vol,
+            "vol_warming_up": warming,
+            "source": "base-uniswap-v3-onchain", "pool": WL1_POOL,
+            # the scanner needs to know which leg is the USD side; work it out here where
+            # token order has already been resolved, rather than assuming it twice
+            "_quote_is_token0": not wl1_is_t0, "_quote_decimals": dq}
+
+
+def _sint256(word):
+    """32-byte hex word -> signed int. Swap amounts are int256: negative means the pool
+    paid that token out. Reading them unsigned turns a sell into ~1.16e77 of volume."""
+    v = int(word, 16)
+    return v - (1 << 256) if v >= (1 << 255) else v
+
+
+def _scan_base_swaps(quote_is_token0, quote_decimals):
+    """Bank Swap volume since the last scan. Called from the snapshot thread only."""
+    head_hex = _rpc_raw("eth_blockNumber", [])
+    if not head_hex:
+        print("[basevol] no RPC answered eth_blockNumber", flush=True)
+        return
+    head = int(head_hex, 16) - BASE_VOL_LAG
+    with _base_vol_lock:
+        start = _base_vol["last_block"]
+    if not start:
+        # First run. Backfill 24h so the figure is usable immediately instead of after a
+        # day of warm-up — ~43k blocks at 2s, which is 15 chunked requests, once.
+        start = head - (86400 // 2) if BASE_VOL_BACKFILL else head
+    if head <= start:
+        return
+
+    frm = start + 1
+    while frm <= head:
+        to = min(frm + BASE_VOL_CHUNK - 1, head)
+        logs = _rpc_raw("eth_getLogs", [{"address": WL1_POOL,
+                                         "fromBlock": hex(frm), "toBlock": hex(to),
+                                         "topics": [BASE_SWAP_TOPIC]}], timeout=30)
+        if logs is None:
+            # Do NOT advance last_block past a window we failed to read, or that volume is
+            # lost silently. Stop here and retry the same range on the next tick.
+            print("[basevol] getLogs failed for blocks {}-{} — will retry".format(frm, to),
+                  flush=True)
+            return
+        usd = 0.0
+        for lg in logs:
+            d = (lg.get("data") or "")[2:]
+            if len(d) < 128:
+                continue
+            a0, a1 = _sint256(d[0:64]), _sint256(d[64:128])
+            amt = a0 if quote_is_token0 else a1
+            usd += abs(amt) / (10 ** quote_decimals)
+        # Stamp the bucket with the BLOCK time, not the scan time. On a backfill every
+        # bucket would otherwise be stamped "now", so a window covering the last 24h would
+        # report zero coverage and sit in warming for a full day — defeating the backfill
+        # entirely. One extra call per chunk.
+        bts = None
+        blk = _rpc_raw("eth_getBlockByNumber", [hex(to), False])
+        if isinstance(blk, dict) and blk.get("timestamp"):
+            try:
+                bts = int(blk["timestamp"], 16)
+            except Exception:
+                bts = None
+        # ts  = end of the bucket    (used to place it in the 24h window)
+        # ts0 = start of the bucket  (used to measure how much history we cover)
+        # Both are needed. Measuring coverage from `ts` alone makes the oldest bucket look
+        # one chunk-length newer than it is — with 3000-block chunks that is ~100 minutes,
+        # enough to keep a full 24h backfill permanently just under the threshold and stuck
+        # in warming. Base blocks are ~2s.
+        end_ts = bts or time.time()
+        with _base_vol_lock:
+            _base_vol["buckets"].append({"ts": end_ts,
+                                         "ts0": end_ts - (to - frm) * 2,
+                                         "from": frm, "to": to, "usd": round(usd, 2)})
+            _base_vol["last_block"] = to
+            cutoff = time.time() - RING_MAX_AGE
+            _base_vol["buckets"] = [b for b in _base_vol["buckets"] if b["ts"] >= cutoff]
+        print("[basevol] banked blocks {}-{}: ${:,.2f} from {} swaps".format(
+            frm, to, usd, len(logs)), flush=True)
+        frm = to + 1
+
+
+def _vol_24h_base():
+    """(usd, warming). warming=True while the banked window is still under 24h."""
+    with _base_vol_lock:
+        if not _base_vol["buckets"]:
+            return None, True
+        now = time.time()
+        window = [b for b in _base_vol["buckets"] if b["ts"] >= now - 86400]
+        oldest = min(b.get("ts0", b["ts"]) for b in _base_vol["buckets"])
+        covered = now - oldest
+        # 23h of coverage is close enough to call the figure a 24h volume; demanding the
+        # full 86400 means one slow chunk keeps it warming for another half hour.
+        return round(sum(b["usd"] for b in window), 2), covered < 82800
 
 
 def _fetch_base_dexscreener():
@@ -311,9 +437,10 @@ def _fetch():
         return round(sum(vals), 2) if vals else None
 
     total_liq = _sum(osmo.get("liquidity_usd"), base.get("liquidity_usd") if base else None)
-    # NB when Base is read on-chain its 24h volume is None (a log scan is out of scope for
-    # a 30s endpoint), so this total is Osmosis-only. vol_24h_complete says so explicitly
-    # rather than letting a partial figure pass as a cross-venue total.
+    # vol_24h_complete is the honest flag: Base volume is banked by the snapshot thread
+    # and is None until the ring covers 24h, so for the first day after a fresh deploy this
+    # total is Osmosis-only. Better to say so than to let a partial figure pass as
+    # cross-venue — which is the mistake the price itself was making.
     total_vol = _sum(osmo.get("vol_24h_usd"), base.get("vol_24h_usd") if base else None)
     vol_complete = bool(base) and base.get("vol_24h_usd") is not None
 
@@ -344,9 +471,12 @@ def _fetch():
         "venues": {
             "osmosis": {"usd": osmo.get("usd"), "liquidity_usd": osmo.get("liquidity_usd"),
                         "vol_24h_usd": osmo.get("vol_24h_usd"), "source": osmo.get("source")},
+            # explicit key list: `base` carries _quote_* internals for the scanner that
+            # have no business in a public response
             "base": ({"usd": base.get("usd"), "liquidity_usd": base.get("liquidity_usd"),
-                      "vol_24h_usd": base.get("vol_24h_usd"), "source": base.get("source"),
-                      "pool": base.get("pool")}
+                      "vol_24h_usd": base.get("vol_24h_usd"),
+                      "vol_warming_up": base.get("vol_warming_up"),
+                      "source": base.get("source"), "pool": base.get("pool")}
                      if base else None),
         },
     }
@@ -397,13 +527,25 @@ def _payload():
 
 # --- pools: snapshots + 24h volume -------------------------------------------
 
+BASE_VOL_STATE = os.environ.get("BASE_VOL_STATE", POOLS_STATE + ".basevol")
+
+
 def _load_ring():
-    global _ring
+    global _ring, _base_vol
     try:
         with open(POOLS_STATE) as f:
             _ring = json.load(f)
     except Exception:
         _ring = []
+    # Separate file on purpose: the two rings have different shapes and lifetimes, and
+    # sharing one would mean a schema change to either could corrupt the other.
+    try:
+        with open(BASE_VOL_STATE) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and "buckets" in d:
+            _base_vol.update(d)
+    except Exception:
+        pass
 
 
 def _save_ring():
@@ -412,6 +554,19 @@ def _save_ring():
         with open(tmp, "w") as f:
             json.dump(_ring, f)
         os.replace(tmp, POOLS_STATE)
+    except Exception:
+        pass
+
+
+def _save_base_vol():
+    try:
+        tmp = BASE_VOL_STATE + ".tmp"
+        with _base_vol_lock:
+            data = {"buckets": list(_base_vol["buckets"]),
+                    "last_block": _base_vol["last_block"]}
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, BASE_VOL_STATE)   # atomic: a half-written ring would lose a day
     except Exception:
         pass
 
@@ -443,12 +598,26 @@ def _snapshot_pools():
         _save_ring()
 
 
+def _snapshot_base_volume():
+    """Ask the venue reader which leg is the USD side, then scan for new swaps."""
+    b = _fetch_base_onchain()
+    if not b:
+        return
+    _scan_base_swaps(b.get("_quote_is_token0", True), b.get("_quote_decimals", 6))
+    _save_base_vol()
+
+
 def _snapshot_loop():
     while True:
-        try:
-            _snapshot_pools()
-        except Exception:
-            pass
+        for job in (_snapshot_pools, _snapshot_base_volume):
+            try:
+                job()
+            except Exception as e:
+                # REPORT IT. The first version swallowed this with a bare `pass`, which is
+                # precisely the failure mode that let the Base venue disappear unnoticed
+                # for weeks. A background job that fails silently is a bug generator.
+                print("[snapshot] {} failed: {}: {}".format(
+                    getattr(job, "__name__", job), type(e).__name__, e), flush=True)
         time.sleep(SNAPSHOT_INTERVAL)
 
 
