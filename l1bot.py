@@ -28,6 +28,14 @@ INTERVAL  = int(os.environ.get("UPDATE_INTERVAL", "60"))
 STATE_FILE = os.environ.get("STATE_FILE", "/data/l1bot_state.json")
 API = "https://api.telegram.org/bot" + TOKEN
 
+# l1price refreshes its cache synchronously, and the Base RPC leg alone can take 4-9 s, so
+# the one request after each expiry can wait well past 10 s. Give it room, retry once, and
+# fall back to the last good payload (clearly marked) instead of "unavailable".
+PRICE_TIMEOUT = 25      # seconds per attempt
+STALE_WARN    = 120     # warn when the API itself serves data older than this (seconds)
+MAX_LAST_GOOD = 900     # reuse our own last good fetch for at most this long (seconds)
+_last_good = {"d": None, "at": 0.0}
+
 
 def tg(method, **params):
     data = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode()
@@ -57,15 +65,50 @@ def _source_label(src):
     }.get(src, src or "—")
 
 
+def fetch_price():
+    """GET the l1price payload, one retry. Remembers the last good result. The URL is
+    public, so logging the failure is safe (the empty log hid this once)."""
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(PRICE_URL, timeout=PRICE_TIMEOUT) as r:
+                d = json.load(r)
+            float(d["usd"])
+            _last_good.update(d=d, at=time.time())
+            return d
+        except Exception as e:
+            print("price fetch attempt {} failed: {}: {}".format(attempt, type(e).__name__, e),
+                  flush=True)
+            if attempt == 2:
+                raise
+            time.sleep(1)
+
+
+def _data_time(d):
+    """'HH:MM UTC' of the price data itself (API `updated`), not of this message."""
+    try:
+        return datetime.strptime(d["updated"], "%Y-%m-%dT%H:%M:%SZ").strftime("%H:%M UTC")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+
 def price_text():
     try:
-        with urllib.request.urlopen(PRICE_URL, timeout=10) as r:
-            d = json.load(r)
+        warn = None
+        try:
+            d = fetch_price()
+        except Exception:
+            if _last_good["d"] is None or time.time() - _last_good["at"] > MAX_LAST_GOOD:
+                raise
+            d = _last_good["d"]
+            warn = "live refresh failed — this price may be out of date"
+        age = d.get("age_seconds")
+        if warn is None and age is not None and age > STALE_WARN:
+            warn = "price is {} min old (the price service could not refresh)".format(int(age // 60))
         usd = float(d["usd"])
         chg = d.get("change_24h_pct")
         vol = d.get("vol_24h_usd")
         mcap = d.get("mcap_usd")
-        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        now = _data_time(d)
         price_line = "Price: ${:.6f}".format(usd)
         if chg is not None:
             price_line += "  (24h {:+.1f}%)".format(chg)
@@ -85,6 +128,8 @@ def price_text():
         if d.get("degraded"):
             note = d.get("note") or "one venue unavailable — price reflects a single market"
             lines += ["", "\u26A0\uFE0F " + note]
+        if warn:
+            lines += ["", "\u26A0\uFE0F " + warn]
         lines += ["", "via github.com/VanPez/l1price"]
         return "\n".join(lines)
     except Exception:
